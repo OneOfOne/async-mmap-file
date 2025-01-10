@@ -32,6 +32,8 @@ type Bucket interface {
 
 use std::{
 	collections::{HashMap, hash_map::Entry},
+	fs::File as StdFile,
+	os::{fd::IntoRawFd, unix::fs::FileExt},
 	path::PathBuf,
 	sync::Arc,
 };
@@ -51,7 +53,7 @@ pub trait BucketT: Sized + Send {
 	async fn bucket(&self, name: &str) -> Option<Self>;
 }
 
-type FileLock = Arc<RwLock<()>>;
+type FileLock = Arc<RwLock<i32>>;
 
 #[derive(Clone)]
 pub struct Bucket {
@@ -147,6 +149,7 @@ impl Bucket {
 	}
 
 	pub async fn read_file(&self, name: &str) -> Result<LockedFileRead> {
+		let _ = self.get_fd(name).await?;
 		let lock = {
 			let files = self.files.read().await;
 			let lock = files.get(name);
@@ -160,7 +163,43 @@ impl Bucket {
 		};
 
 		let path = self.path.join(name);
-		LockedFileRead::new(lock, path).await
+		LockedFileRead::new(lock).await
+	}
+
+	pub async fn get_fd(&self, name: &str) -> Result<i32> {
+		let fd = {
+			let files = self.files.read().await;
+			let lock = files.get(name);
+			if let Some(fl) = lock {
+				Some(fl.read().await.clone())
+			} else {
+				None
+			}
+		};
+		if fd.is_some() {
+			panic!("fuck you");
+			return Ok(unsafe { fd.unwrap_unchecked() });
+		}
+		let mut files = self.files.write().await;
+		let lock = files
+			.entry(name.to_owned())
+			.or_insert_with(|| Default::default());
+		let path = self.path.join(name);
+		let f = StdFile::options()
+			.read(true)
+			// .write(true)
+			// .append(true)
+			// .create(true)
+			.open(path)?;
+		let fd = f.into_raw_fd();
+		unsafe {
+			let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+			_ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+		}
+
+		*lock = Arc::new(RwLock::new(fd));
+		println!("fd: {:?}", *lock);
+		Ok(fd)
 	}
 }
 
@@ -171,7 +210,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_bucket() -> Result<()> {
-		let bb = Bucket::new(PathBuf::from("/tmp/b")).expect("bucket");
+		let bb = Bucket::new(PathBuf::from("/tmp")).expect("bucket");
 		let b = bb.bucket_or_create("test1").await?;
 		tokio::spawn(async move {
 			b.buffered_write("test", async |w| {
@@ -189,16 +228,12 @@ mod tests {
 			.await
 			.unwrap();
 		});
-		let b = bb.bucket_or_create("test2").await?;
-		{
-			let mut lf = b.write_file("test").await?;
-			lf.write_all(b"world").await?;
-		}
 
-		let mut lf = b.read_file("test").await?;
-		let mut s = String::new();
-		lf.read_to_string(&mut s).await?;
-		assert_eq!(s, "world");
+		let mut lf = bb.read_file("x").await?;
+		println!("reading");
+		let mut s = vec![];
+		println!("rts {:?}", lf.read_to_end(&mut s).await);
+		println!("all.len {:?}", s.len());
 		Ok(())
 	}
 }

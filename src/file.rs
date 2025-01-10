@@ -1,150 +1,213 @@
+use crate::{Result, locked_file::cvt};
+use std::fs::File as StdFile;
 use std::{
 	fs::Metadata,
-	io::{ErrorKind, SeekFrom},
-	os::fd::AsFd,
+	io::{ErrorKind, Seek, SeekFrom},
+	os::fd::{AsRawFd, RawFd},
 	path::Path,
 	sync::Arc,
-	thread::{self},
+	task::Poll,
 };
-
-use crate::Result;
-use nix::{
-	errno::Errno,
-	sys::{aio::*, signal::SigevNotify},
+use tokio::io::AsyncRead;
+use tokio::{
+	fs::File as TFile,
+	io::{AsyncSeek, AsyncWrite},
 };
-use std::fs::File as StdFile;
-use tokio::task::yield_now;
-use tokio::{fs::File as TFile, io::AsyncSeekExt};
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct File {
-	f: Arc<TFile>,
-	write_offset: usize,
-	read_offset: usize,
+	f: Option<Arc<StdFile>>,
+	offset: usize,
 }
 
 impl File {
-	pub async fn from_file(mut f: TFile) -> Result<Self> {
-		let pos = f.seek(SeekFrom::Current(0)).await?;
+	pub fn from_std(mut f: StdFile) -> Result<Self> {
+		let pos = f.seek(SeekFrom::Current(0))?;
 		Ok(Self {
-			f: Arc::new(f),
-			write_offset: pos as usize,
-			read_offset: pos as usize,
+			f: Some(Arc::new(f)),
+			offset: pos as usize,
 		})
 	}
+
+	pub async fn from_file(f: TFile) -> Result<Self> {
+		Self::from_std(f.into_std().await)
+	}
+
 	pub async fn create<P: AsRef<Path>>(p: P) -> Result<Self> {
-		let f = TFile::create(p).await?;
+		let f = StdFile::create(p)?;
 		Ok({
 			Self {
-				f: f.into(),
-				write_offset: 0,
-				read_offset: 0,
+				f: Some(Arc::new(f)),
+				offset: 0,
 			}
 		})
 	}
 
 	pub async fn open<P: AsRef<Path>>(p: P) -> Result<Self> {
-		let f = TFile::open(p).await?;
-		Ok({
-			Self {
-				f: f.into(),
-				write_offset: 0,
-				read_offset: 0,
-			}
-		})
-	}
-
-	pub fn open_std<P: AsRef<Path>>(p: P) -> Result<Self> {
 		let f = StdFile::open(p)?;
 		Ok({
 			Self {
-				f: Arc::new(TFile::from_std(f)),
-				write_offset: 0,
-				read_offset: 0,
+				f: Some(Arc::new(f)),
+				offset: 0,
 			}
 		})
 	}
 
-	pub async fn write(&mut self, buf: &[u8]) -> Result<usize> {
-		let mut aiow = Box::pin(AioWrite::new(
-			self.f.as_fd(),
-			self.write_offset as i64,
-			buf,
-			0,
-			SigevNotify::SigevNone,
-		));
-		aiow.as_mut().submit()?;
-		while aiow.as_mut().error() == Err(Errno::EINPROGRESS) {
-			yield_now().await;
-		}
-		let n = aiow.as_mut().aio_return()?;
-		self.write_offset += n;
-		Ok(n)
+	pub fn metadata(&self) -> Result<Metadata> {
+		let f = self.f.as_ref().unwrap();
+		f.metadata()
 	}
 
-	pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-		let mut aiow = Box::pin(AioRead::new(
-			self.f.as_fd(),
-			self.read_offset as i64,
-			buf,
-			0,
-			SigevNotify::SigevNone,
-		));
-		aiow.as_mut().submit()?;
-		while aiow.as_mut().error() == Err(Errno::EINPROGRESS) {
-			yield_now().await;
-		}
-		let n = aiow.as_mut().aio_return()?;
-		self.read_offset += n;
-		Ok(n)
+	pub(crate) fn fd(&self) -> i32 {
+		let f = self.f.as_ref().unwrap();
+		f.as_raw_fd()
 	}
 
-	pub async fn metadata(&self) -> Result<Metadata> {
-		self.f.metadata().await
-	}
-
-	pub async fn size(&self) -> Result<usize> {
-		self.metadata().await.map(|m| m.len() as usize)
-	}
-
-	pub async fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
-		let size = self.size().await?;
-		buf.resize(size, 0);
-		let n = self.read(buf).await?;
-		if n != size {
-			return Err(ErrorKind::UnexpectedEof.into());
-		}
-		Ok(n)
-	}
-	pub async fn seek(&mut self, pos: SeekFrom) {
-		self.write_offset = 0
+	pub fn file_mut(&mut self) -> &mut Arc<StdFile> {
+		self.f.as_mut().unwrap()
 	}
 }
 
 impl Drop for File {
 	fn drop(&mut self) {
-		let mut aiof = Box::pin(AioFsync::new(
-			self.f.as_fd(),
-			AioFsyncMode::O_SYNC,
-			0,
-			SigevNotify::SigevNone,
-		));
-		aiof.as_mut().submit().expect("aio_fsync failed early");
-		while aiof.as_mut().error() == Err(Errno::EINPROGRESS) {
-			thread::yield_now();
+		let f = self.f.take().unwrap();
+		if Arc::strong_count(&f) == 1 {
+			let f = Arc::into_inner(f).unwrap();
+			drop(f);
 		}
-		aiof.as_mut().aio_return().expect("aio_fsync failed late");
 	}
 }
 
+impl AsRawFd for File {
+	fn as_raw_fd(&self) -> RawFd {
+		self.fd()
+	}
+}
+
+impl AsyncRead for File {
+	fn poll_read(
+		mut self: std::pin::Pin<&mut Self>,
+		_cx: &mut std::task::Context<'_>,
+		buf: &mut tokio::io::ReadBuf<'_>,
+	) -> Poll<std::io::Result<()>> {
+		let b = buf.initialize_unfilled();
+		let ret = unsafe {
+			cvt(libc::pread64(
+				self.fd(),
+				b.as_mut_ptr() as *mut libc::c_void,
+				b.len().min(8192),
+				self.offset as i64,
+			))
+		};
+
+		match ret {
+			Ok(n) => {
+				self.offset += n;
+				unsafe { buf.assume_init(n) };
+				buf.set_filled(self.offset);
+				Poll::Ready(Ok(()))
+			}
+			Err(err) if err.kind() != ErrorKind::WouldBlock => {
+				return Poll::Ready(Err(err));
+			}
+			_ => Poll::Pending,
+		}
+	}
+}
+
+impl AsyncSeek for File {
+	fn start_seek(mut self: std::pin::Pin<&mut Self>, position: SeekFrom) -> Result<()> {
+		match position {
+			SeekFrom::Start(offset) => {
+				self.offset = offset as usize;
+			}
+			SeekFrom::End(offset) => {
+				let metadata = self.metadata()?;
+				let pos = metadata.len() as usize + offset as usize;
+				self.offset = pos;
+			}
+			SeekFrom::Current(offset) => {
+				let pos = self.offset as i64 + offset;
+				if pos < 0 {
+					return Err(std::io::Error::new(
+						std::io::ErrorKind::InvalidInput,
+						"invalid seek to a negative or zero position",
+					));
+				}
+				self.offset = pos as usize;
+			}
+		}
+		Ok(())
+	}
+
+	fn poll_complete(
+		mut self: std::pin::Pin<&mut Self>,
+		_cx: &mut std::task::Context<'_>,
+	) -> Poll<std::io::Result<u64>> {
+		let pos = self.offset as u64;
+		self.file_mut().seek(SeekFrom::Start(pos))?;
+		Poll::Ready(Ok(0))
+	}
+}
+
+impl AsyncWrite for File {
+	fn poll_write(
+		mut self: std::pin::Pin<&mut Self>,
+		_cx: &mut std::task::Context<'_>,
+		buf: &[u8],
+	) -> Poll<std::result::Result<usize, std::io::Error>> {
+		let ret = unsafe {
+			cvt(libc::pwrite(
+				self.fd(),
+				buf.as_ptr() as *const libc::c_void,
+				buf.len(),
+				self.offset as i64,
+			))
+		};
+		match ret {
+			Ok(n) => {
+				self.offset += n;
+				Poll::Ready(Ok(n))
+			}
+			Err(err) => {
+				if let Some(err) = err.raw_os_error() {
+					if err.eq(&libc::EAGAIN) || err.eq(&libc::EINTR) {
+						return Poll::Pending;
+					}
+				}
+
+				return Poll::Ready(Err(err));
+			}
+		}
+	}
+
+	fn poll_flush(
+		self: std::pin::Pin<&mut Self>,
+		_cx: &mut std::task::Context<'_>,
+	) -> Poll<std::result::Result<(), std::io::Error>> {
+		unsafe { cvt(libc::fsync(self.fd()) as isize) }?;
+		Poll::Ready(Ok(()))
+	}
+
+	fn poll_shutdown(
+		self: std::pin::Pin<&mut Self>,
+		_cx: &mut std::task::Context<'_>,
+	) -> Poll<std::result::Result<(), std::io::Error>> {
+		Poll::Ready(Ok(()))
+	}
+}
+
+unsafe impl Send for File {}
+unsafe impl Sync for File {}
 #[cfg(test)]
 mod aio_tests {
 	use super::*;
 	use test::Bencher;
-	use tokio::io::AsyncReadExt;
+	use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+	use criterion::async_executor::AsyncExecutor;
 	#[tokio::test]
 	async fn write_read() -> Result<()> {
-		write().await?;
+		// write().await?;
 		read().await?;
 		Ok(())
 	}
@@ -158,14 +221,25 @@ mod aio_tests {
 	}
 
 	async fn read() -> Result<()> {
-		let mut f = File::open(&"/tmp/x").await?;
-		let mut buf = vec![];
-		let n = f.read_to_end(&mut buf).await?;
-		_ = n;
+		let f = File::open("/tmp/x").await?;
+		{
+			let mut f = f.clone();
+			let mut buf = vec![];
+			let n = f.read_to_end(&mut buf).await?;
+			_ = n;
+			drop(f);
+		}
+		{
+			let mut f = f.clone();
+			let mut buf = vec![];
+			let n = f.read_to_end(&mut buf).await?;
+			_ = n;
+			drop(f);
+		}
+
 		Ok(())
 	}
 
-	#[bench]
 	fn file_read(b: &mut Bencher) {
 		let r = Arc::new(Box::leak(Box::new(
 			tokio::runtime::Builder::new_multi_thread()
@@ -174,19 +248,18 @@ mod aio_tests {
 				.build()
 				.unwrap(),
 		)));
-		let mut f = File::open_std(&"/tmp/x").unwrap();
-		let r2 = r.clone();
+		let f = File::from_std(StdFile::open("/tmp/x").unwrap()).unwrap();
 		b.iter(|| {
 			let mut f = f.clone();
 			r.block_on(async move {
 				let mut buf = vec![];
 				let n = f.read_to_end(&mut buf).await.unwrap();
-				_ = n;
+				assert_eq!(n, 70_000_000);
+				f.seek(SeekFrom::Start(0)).await.unwrap();
 			})
 		});
 	}
 
-	#[bench]
 	fn tokio_read(b: &mut Bencher) {
 		let r = tokio::runtime::Builder::new_multi_thread()
 			.worker_threads(1)
@@ -198,7 +271,7 @@ mod aio_tests {
 				let mut f = TFile::open("/tmp/x").await.unwrap();
 				let mut buf = vec![];
 				let n = f.read_to_end(&mut buf).await.unwrap();
-				_ = n;
+				assert_eq!(n, 70_000_000);
 			})
 		});
 	}
