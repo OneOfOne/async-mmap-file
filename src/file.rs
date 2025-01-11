@@ -204,7 +204,6 @@ mod aio_tests {
 	use test::Bencher;
 	use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
-	use criterion::async_executor::AsyncExecutor;
 	#[tokio::test]
 	async fn write_read() -> Result<()> {
 		// write().await?;

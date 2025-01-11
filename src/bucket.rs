@@ -33,7 +33,7 @@ type Bucket interface {
 use std::{
 	collections::{HashMap, hash_map::Entry},
 	fs::File as StdFile,
-	os::{fd::IntoRawFd, unix::fs::FileExt},
+	os::fd::IntoRawFd,
 	path::PathBuf,
 	sync::Arc,
 };

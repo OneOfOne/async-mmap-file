@@ -6,10 +6,10 @@ use std::{
 	task::Poll,
 };
 
-use nix::errno::{self, Errno};
+use nix::errno::{Errno};
 use tokio::{
 	fs::File,
-	io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt},
+	io::{AsyncRead, AsyncWrite},
 	sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock},
 };
 

@@ -10,6 +10,7 @@ libc = "0.2.169"
 nix = { version = "0.29.0", features = ["aio", "fs", "uio"] }
 tokio = { version = "1.42.0", features = ["full", "mio"] }
 criterion = { version = "0.5.1", features = ["async_tokio", "async", "async_futures"] }
+memmap2 = "0.9.5"
 
 [[bench]]
 name = "files"
