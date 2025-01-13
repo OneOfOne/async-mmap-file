@@ -1,3 +1,6 @@
+#![feature(async_drop)]
+use std::future::async_drop;
+
 use async_mmap_file::MmapFile;
 use criterion::*;
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -24,7 +27,8 @@ fn bench_files(c: &mut Criterion) {
 			.expect("create failed");
 		let buf = vec!['@' as u8; SIZE];
 		f.write_all(&buf).await.expect("write all failed");
-		f.flush().await.expect("flush failed");
+		async_drop(f).await;
+		// f.flush().await.expect("flush failed");
 	});
 
 	c.bench_function("MmapFile", |b| {

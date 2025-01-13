@@ -64,13 +64,7 @@ impl MmapOpenOptions {
 
 	pub async fn open(&self, fp: impl AsRef<Path>) -> Result<MmapFile> {
 		let f = self.opts.open(fp).await?;
-		let m = unsafe { memmap2::MmapOptions::new().populate().map_copy_read_only(&f)? };
-		Ok(MmapFile {
-			f: f.into(),
-			m: m.into(),
-			write: self.write.unwrap_or(false),
-			offset: 0,
-		})
+		MmapFile::from_file(f)
 	}
 }
 
@@ -102,7 +96,8 @@ impl MmapFile {
 	}
 
 	pub fn from_file(f: TokioFile) -> Result<Self> {
-		let m = unsafe { memmap2::MmapOptions::new().populate().map_copy_read_only(&f)? };
+		// this errors if the file isn't open as read, need to figure it out
+		let m = unsafe { memmap2::MmapOptions::new().populate().map(&f)? };
 		Ok(Self {
 			f: f.into(),
 			m: m.into(),
@@ -342,7 +337,6 @@ mod tests {
 		const SIZE: usize = 10 * 1024 * 1024;
 		let path = "/tmp/x";
 		let mut f = MmapFile::options()
-			.read(true)
 			.write(true)
 			.create(true)
 			.truncate(true)
