@@ -1,14 +1,14 @@
-#![feature(async_drop)]
-use std::future::async_drop;
-
-use async_mmap_file::MmapFile;
+use async_mmap_file::FileMap;
 use criterion::*;
 use futures::{StreamExt, stream::FuturesUnordered};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::{
+	fs::File,
+	io::{AsyncReadExt, AsyncWriteExt},
+};
 extern crate criterion;
 
 fn bench_files(c: &mut Criterion) {
-	const SIZE: usize = 10 * 1024 * 1024;
+	const SIZE: usize = 100 * 1024 * 1024;
 	let r = tokio::runtime::Builder::new_multi_thread()
 		.worker_threads(16)
 		.enable_all()
@@ -17,23 +17,16 @@ fn bench_files(c: &mut Criterion) {
 
 	r.block_on(async {
 		let path = "/tmp/x";
-		let mut f = MmapFile::options()
-			.read(true)
-			.write(true)
-			.create(true)
-			.truncate(true)
-			.open(&path)
-			.await
-			.expect("create failed");
+		let mut f = File::create(&path).await.expect("create failed");
 		let buf = vec!['@' as u8; SIZE];
 		f.write_all(&buf).await.expect("write all failed");
-		async_drop(f).await;
-		// f.flush().await.expect("flush failed");
+		f.flush().await.expect("flush failed");
 	});
 
 	c.bench_function("MmapFile", |b| {
+		let fm = FileMap::new();
 		b.to_async(&r).iter(|| async {
-			let f = MmapFile::open("/tmp/x").await.unwrap();
+			let f = fm.get("/tmp/x").await.unwrap();
 			let mut futs = FuturesUnordered::new();
 			for _ in 0..50 {
 				let f = f.clone();
@@ -45,9 +38,7 @@ fn bench_files(c: &mut Criterion) {
 				}));
 			}
 
-			while let Some(result) = futs.next().await {
-				_ = result
-			}
+			while let Some(_) = futs.next().await {}
 		})
 	});
 
@@ -62,9 +53,7 @@ fn bench_files(c: &mut Criterion) {
 					assert_eq!(n, SIZE);
 				}));
 			}
-			while let Some(result) = futs.next().await {
-				_ = result
-			}
+			while let Some(_) = futs.next().await {}
 		})
 	});
 }
