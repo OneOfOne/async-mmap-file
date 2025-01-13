@@ -3,9 +3,8 @@ use futures::{FutureExt, executor::block_on};
 use memmap2::Mmap;
 use std::{
 	fs::File as StdFile,
-	future::AsyncDrop,
 	io::{Error, ErrorKind, SeekFrom},
-	ops::{Deref, DerefMut},
+	ops::Deref,
 	path::Path,
 	pin::Pin,
 	sync::{Arc, LazyLock},
@@ -87,9 +86,10 @@ impl MmapOpenOptions {
 #[derive(Clone)]
 pub struct MmapFile {
 	f: Arc<TokioFile>,
-	m: Arc<Mmap>,
+	m: Option<Arc<Mmap>>,
 	write: bool,
 	offset: usize,
+	position: Option<SeekFrom>,
 }
 
 impl MmapFile {
@@ -99,12 +99,17 @@ impl MmapFile {
 
 	pub fn from_file(f: TokioFile) -> Result<Self> {
 		// this errors if the file isn't open as read, need to figure it out
-		let m = unsafe { memmap2::MmapOptions::new().populate().map_copy_read_only(&f)? };
+		let m = if let Ok(m) = unsafe { memmap2::MmapOptions::new().populate().map_copy_read_only(&f) } {
+			Some(Arc::new(m))
+		} else {
+			None
+		};
 		Ok(Self {
 			f: f.into(),
-			m: m.into(),
+			m,
 			write: false,
 			offset: 0,
+			position: None,
 		})
 	}
 
@@ -121,17 +126,21 @@ impl MmapFile {
 		Self::options().create(true).open(p).await
 	}
 
+	pub async fn create_new<P: AsRef<Path>>(p: P) -> Result<Self> {
+		Self::options().create_new(true).open(p).await
+	}
+
 	pub fn file_mut(&mut self) -> Option<&mut TokioFile> {
 		Arc::get_mut(&mut self.f)
 	}
 
-	pub fn mmap_raw(&self) -> &Mmap {
-		&self.m
-	}
-
 	pub fn reload_mmap(&mut self) -> Result<()> {
-		let m = unsafe { memmap2::MmapOptions::new().populate().map_copy_read_only(&self.f)? };
-		self.m = m.into();
+		let m = if let Ok(m) = unsafe { memmap2::MmapOptions::new().populate().map_copy_read_only(&self.f) } {
+			Some(Arc::new(m))
+		} else {
+			None
+		};
+		self.m = m;
 		Ok(())
 	}
 	/// Reads data into the provided buffer starting at the specified offset.
@@ -210,39 +219,47 @@ impl MmapFile {
 
 impl AsyncRead for MmapFile {
 	fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<Result<()>> {
-		let mut len = buf.remaining().min(self.m.len() - self.offset);
-		if len > *PAGE_SIZE {
-			len = *PAGE_SIZE;
+		if let Some(m) = self.m.as_ref() {
+			let mut len = buf.remaining().min(m.len() - self.offset);
+			if len > *PAGE_SIZE {
+				len = *PAGE_SIZE;
+			}
+			buf.put_slice(&m[self.offset..self.offset + len]);
+			self.offset += len;
+			Poll::Ready(Ok(()))
+		} else {
+			Poll::Ready(Err(Error::new(ErrorKind::Other, "write-only file")))
 		}
-		buf.put_slice(&self.m[self.offset..self.offset + len]);
-		self.offset += len;
-		Poll::Ready(Ok(()))
 	}
 }
 
 impl AsyncSeek for MmapFile {
 	fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> Result<()> {
-		match position {
-			SeekFrom::Start(offset) => {
-				if offset > self.m.len() as u64 {
-					return Err(Error::new(ErrorKind::InvalidInput, "invalid position"));
+		if let Some(m) = self.m.as_ref() {
+			match position {
+				SeekFrom::Start(offset) => {
+					if offset > m.len() as u64 {
+						return Err(Error::new(ErrorKind::InvalidInput, "invalid position"));
+					}
+					self.offset = offset as usize;
 				}
-				self.offset = offset as usize;
-			}
-			SeekFrom::End(offset) => {
-				let pos = self.m.len() as i64 + offset;
-				if pos < 0 || pos > self.m.len() as i64 {
-					return Err(Error::new(ErrorKind::InvalidInput, "invalid position"));
+				SeekFrom::End(offset) => {
+					let pos = m.len() as i64 + offset;
+					if pos < 0 || pos > m.len() as i64 {
+						return Err(Error::new(ErrorKind::InvalidInput, "invalid position"));
+					}
+					self.offset = pos as usize;
 				}
-				self.offset = pos as usize;
-			}
-			SeekFrom::Current(offset) => {
-				let pos = self.offset as i64 + offset;
-				if pos < 0 || pos > self.m.len() as i64 {
-					return Err(Error::new(ErrorKind::InvalidInput, "invalid position"));
+				SeekFrom::Current(offset) => {
+					let pos = self.offset as i64 + offset;
+					if pos < 0 || pos > m.len() as i64 {
+						return Err(Error::new(ErrorKind::InvalidInput, "invalid position"));
+					}
+					self.offset = pos as usize;
 				}
-				self.offset = pos as usize;
 			}
+		} else {
+			self.position = Some(position);
 		}
 		Ok(())
 	}
@@ -250,9 +267,12 @@ impl AsyncSeek for MmapFile {
 	fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<u64>> {
 		let offset = self.offset as u64;
 		if self.write {
+			let pos = self.position.unwrap_or_else(|| SeekFrom::Start(offset));
 			if let Some(f) = self.file_mut() {
-				let mut fut = Box::pin(f.seek(SeekFrom::Start(offset)));
+				let mut fut = Box::pin(f.seek(pos));
 				return fut.poll_unpin(cx);
+			} else {
+				return Poll::Ready(Err(Error::new(ErrorKind::Other, "multiple writers aren't allowed")));
 			}
 		}
 		Poll::Ready(Ok(offset))
@@ -318,7 +338,7 @@ impl Deref for MmapFile {
 
 impl Drop for MmapFile {
 	fn drop(&mut self) {
-		if let Some(mut f) = Arc::get_mut(&mut self.f)
+		if let Some(f) = Arc::get_mut(&mut self.f)
 			&& self.write
 		{
 			block_on(f.shutdown()).expect("shutdown failed");
@@ -328,8 +348,6 @@ impl Drop for MmapFile {
 
 #[cfg(test)]
 mod tests {
-	use std::future::async_drop;
-
 	use super::*;
 	use tokio::{fs::remove_file, io::AsyncReadExt};
 
