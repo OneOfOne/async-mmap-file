@@ -1,5 +1,5 @@
 use crate::Result;
-use futures::FutureExt;
+use futures::{FutureExt, executor::block_on};
 use memmap2::Mmap;
 use std::{
 	fs::File as StdFile,
@@ -42,8 +42,7 @@ impl MmapOpenOptions {
 
 	pub fn create(&mut self, create: bool) -> &mut Self {
 		self.opts.create(create);
-		self.write = Some(create);
-		self
+		self.write(create)
 	}
 
 	pub fn create_new(&mut self, create_new: bool) -> &mut Self {
@@ -62,9 +61,12 @@ impl MmapOpenOptions {
 		self
 	}
 
-	pub async fn open(&self, fp: impl AsRef<Path>) -> Result<MmapFile> {
+	pub async fn open(&mut self, fp: impl AsRef<Path>) -> Result<MmapFile> {
+		self.read(true); // this is bugged atm
 		let f = self.opts.open(fp).await?;
-		MmapFile::from_file(f)
+		let mut f = MmapFile::from_file(f)?;
+		f.write = self.write.unwrap_or(false);
+		Ok(f)
 	}
 }
 
@@ -97,7 +99,7 @@ impl MmapFile {
 
 	pub fn from_file(f: TokioFile) -> Result<Self> {
 		// this errors if the file isn't open as read, need to figure it out
-		let m = unsafe { memmap2::MmapOptions::new().populate().map(&f)? };
+		let m = unsafe { memmap2::MmapOptions::new().populate().map_copy_read_only(&f)? };
 		Ok(Self {
 			f: f.into(),
 			m: m.into(),
@@ -113,6 +115,10 @@ impl MmapFile {
 	pub async fn open<P: AsRef<Path>>(p: P) -> Result<Self> {
 		let f = TokioFile::open(p).await?;
 		Self::from_file(f)
+	}
+
+	pub async fn create<P: AsRef<Path>>(p: P) -> Result<Self> {
+		Self::options().create(true).open(p).await
 	}
 
 	pub fn file_mut(&mut self) -> Option<&mut TokioFile> {
@@ -310,21 +316,16 @@ impl Deref for MmapFile {
 	}
 }
 
-impl AsyncDrop for MmapFile {
-	type Dropper<'a> = impl Future<Output = ()> + 'a;
-
-	fn async_drop(mut self: Pin<&mut Self>) -> Self::Dropper<'_> {
-		println!("dropping");
-		async move {
-			if Arc::strong_count(&self.f) == 1 && self.write {
-				let f = self.file_mut().unwrap();
-				f.shutdown().await.expect("shutdown failed");
-			}
+impl Drop for MmapFile {
+	fn drop(&mut self) {
+		if let Some(mut f) = Arc::get_mut(&mut self.f)
+			&& self.write
+		{
+			block_on(f.shutdown()).expect("shutdown failed");
 		}
 	}
 }
 
-// unsafe impl Send for MmapFile {}
 #[cfg(test)]
 mod tests {
 	use std::future::async_drop;
@@ -337,6 +338,7 @@ mod tests {
 		const SIZE: usize = 10 * 1024 * 1024;
 		let path = "/tmp/x";
 		let mut f = MmapFile::options()
+			.read(true)
 			.write(true)
 			.create(true)
 			.truncate(true)
@@ -345,7 +347,7 @@ mod tests {
 			.expect("create failed");
 		let buf = vec!['@' as u8; SIZE];
 		f.write_all(&buf).await.expect("write all failed");
-		async_drop(f).await;
+		drop(f);
 		let mut f = MmapFile::open(&path).await.expect("open failed");
 		let mut buf = String::with_capacity(SIZE);
 		let n1 = f.read_to_string(&mut buf).await.expect("read to string failed");
