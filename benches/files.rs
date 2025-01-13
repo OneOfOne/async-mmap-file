@@ -5,7 +5,6 @@ use tokio::{
 	fs::File,
 	io::{AsyncReadExt, AsyncWriteExt},
 };
-extern crate criterion;
 
 fn file_benches(c: &mut Criterion) {
 	const SIZE: usize = 100 * 1024 * 1024;
