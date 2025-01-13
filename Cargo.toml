@@ -4,17 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1", features = ["fs", "io-std", "io-util", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = [
+	"fs",
+	"io-std",
+	"io-util",
+	"rt-multi-thread",
+	"macros",
+] }
 memmap2 = "0.9"
 libc = "0.2"
 futures = "0.3"
 
 [dev-dependencies]
-criterion = { version = "0.5.1", features = [
-	"async_tokio",
-	"async",
-	"async_futures",
-] }
+criterion = { version = "0.5.1", features = ["async_tokio", "async"] }
 
 [[bench]]
 name = "files"

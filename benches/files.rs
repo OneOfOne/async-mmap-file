@@ -7,7 +7,7 @@ use tokio::{
 };
 extern crate criterion;
 
-fn bench_files(c: &mut Criterion) {
+fn file_benches(c: &mut Criterion) {
 	const SIZE: usize = 100 * 1024 * 1024;
 	let r = tokio::runtime::Builder::new_multi_thread()
 		.worker_threads(16)
@@ -58,5 +58,5 @@ fn bench_files(c: &mut Criterion) {
 	});
 }
 
-criterion_group!(benches, bench_files);
+criterion_group!(benches, file_benches);
 criterion_main!(benches);

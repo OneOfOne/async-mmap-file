@@ -41,7 +41,9 @@ impl MmapFile {
 		let p = p.as_ref().to_owned();
 		let f = spawn_blocking(async move || -> Result<StdFile> {
 			let f = StdFile::open(p)?;
-			f.lock()?;
+			if !f.try_lock()? {
+				return Err(Error::new(ErrorKind::Other, "failed to lock"));
+			}
 			Ok(f)
 		})
 		.await?
@@ -181,20 +183,19 @@ mod tests {
 	async fn test_mmap() -> Result<()> {
 		const SIZE: usize = 10 * 1024 * 1024;
 		let path = "/tmp/x";
-		let mut f = File::options()
-			.write(true)
-			.create(true)
-			.truncate(true)
-			.open(&path)
-			.await
-			.expect("create failed");
-		let buf = vec!['@' as u8; SIZE];
-		f.write_all(&buf).await.expect("write all failed");
-		f.flush().await.expect("flush failed");
+		{
+			let mut f = File::create(&path).await.expect("create failed");
+			let buf = vec!['@' as u8; SIZE];
+			f.write_all(&buf).await.expect("write all failed");
+			f.flush().await.expect("flush failed");
+		}
 		let mut f = MmapFile::open(&path).await.expect("open failed");
 		let mut buf = String::with_capacity(SIZE);
 		let n1 = f.read_to_string(&mut buf).await.expect("read to string failed");
 		assert_eq!(n1, SIZE);
+
+		// Make sure we can't reopen the same file
+		assert!(MmapFile::open(&path).await.is_err());
 
 		remove_file(&path).await.expect("remove file failed");
 		Ok(())
