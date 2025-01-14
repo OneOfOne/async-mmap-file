@@ -9,20 +9,24 @@ use std::{
 	sync::{Arc, LazyLock},
 	task::{Context, Poll},
 };
-use tokio::io::AsyncWrite;
 use tokio::{
-	io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWriteExt, ReadBuf},
+	fs::File as TokioFile,
+	io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ReadBuf},
 	task::spawn_blocking,
 };
 
 static PAGE_SIZE: LazyLock<usize> = LazyLock::new(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE).min(4096) } as usize);
 
-/// MmapFile is a memory-mapped read-only file implementing AsyncRead / AsyncSeek
+/// A memory-mapped read-only file implementing AsyncRead / AsyncSeek
 ///
-/// SAFETY: The file must be locked before reading from it.
-#[derive(Clone)]
+/// SAFETY:
+///
+/// The file must be locked before reading from it.
+///
+/// If the file is modified on disk, the universe may or may not implode.
+#[derive(Clone, Debug)]
 pub struct MmapFile {
-	f: Arc<StdFile>,
+	f: Arc<TokioFile>,
 	m: Arc<Mmap>,
 	offset: usize,
 }
@@ -39,25 +43,19 @@ impl MmapFile {
 	/// A `Result` containing the `MmapFile` instance if successful, or an error if not.
 	pub async fn open(p: impl AsRef<Path>) -> Result<Self> {
 		let p = p.as_ref().to_owned();
-		let f = spawn_blocking(async move || -> Result<StdFile> {
+		let (f, m) = spawn_blocking(async move || -> Result<(StdFile, Mmap)> {
 			let f = StdFile::open(p)?;
-			if !f.try_lock()? {
-				return Err(Error::new(ErrorKind::Other, "failed to lock"));
-			}
-			Ok(f)
+			let m = unsafe { memmap2::MmapOptions::new().populate().map_copy_read_only(&f)? };
+			Ok((f, m))
 		})
 		.await?
 		.await?;
-		let m = unsafe { memmap2::MmapOptions::new().populate().map_copy_read_only(&f)? };
+
 		Ok(Self {
-			f: f.into(),
+			f: TokioFile::from_std(f).into(),
 			m: m.into(),
 			offset: 0,
 		})
-	}
-
-	fn file_mut(&mut self) -> Option<&mut StdFile> {
-		Arc::get_mut(&mut self.f)
 	}
 
 	/// Reads data into the provided buffer starting at the specified offset.
@@ -106,15 +104,16 @@ impl MmapFile {
 		self.seek(SeekFrom::Start(0)).await?;
 		Ok(total)
 	}
+
+	pub fn reader_count(&self) -> usize {
+		Arc::strong_count(&self.f)
+	}
 }
 
 impl AsyncRead for MmapFile {
 	fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<Result<()>> {
 		let m = &self.m;
-		let mut len = buf.remaining().min(m.len() - self.offset);
-		if len > *PAGE_SIZE {
-			len = *PAGE_SIZE;
-		}
+		let len = buf.remaining().min(m.len() - self.offset).min(*PAGE_SIZE);
 		buf.put_slice(&m[self.offset..self.offset + len]);
 		self.offset += len;
 		Poll::Ready(Ok(()))
@@ -156,18 +155,10 @@ impl AsyncSeek for MmapFile {
 }
 
 impl Deref for MmapFile {
-	type Target = StdFile;
+	type Target = TokioFile;
 
 	fn deref(&self) -> &Self::Target {
-		self.f.as_ref()
-	}
-}
-
-impl Drop for MmapFile {
-	fn drop(&mut self) {
-		if let Some(f) = self.file_mut() {
-			f.unlock().expect("failed to unlock");
-		}
+		&self.f
 	}
 }
 
@@ -193,10 +184,6 @@ mod tests {
 		let mut buf = String::with_capacity(SIZE);
 		let n1 = f.read_to_string(&mut buf).await.expect("read to string failed");
 		assert_eq!(n1, SIZE);
-
-		// Make sure we can't reopen the same file
-		assert!(MmapFile::open(&path).await.is_err());
-
 		remove_file(&path).await.expect("remove file failed");
 		Ok(())
 	}

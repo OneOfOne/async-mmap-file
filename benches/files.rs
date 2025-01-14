@@ -22,8 +22,8 @@ fn file_benches(c: &mut Criterion) {
 		f.flush().await.expect("flush failed");
 	});
 
+	let fm = FileMap::new();
 	c.bench_function("MmapFile", |b| {
-		let fm = FileMap::new();
 		b.to_async(&r).iter(|| async {
 			let f = fm.get("/tmp/x").await.unwrap();
 			let mut futs = FuturesUnordered::new();
