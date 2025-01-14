@@ -190,7 +190,7 @@ mod tests {
 		let f = file_map.get("/tmp/y").await.expect("reader failed");
 		assert!(file_map.try_writer("/tmp/y", false).await.is_err());
 		drop(f);
-		let w = file_map.writer("/tmp/y", false).await;
+		let w = file_map.try_writer("/tmp/y", false).await.expect("writer failed");
 		assert!(file_map.get("/tmp/y").await.is_err());
 		drop(w);
 		file_map.get("/tmp/y").await.expect("reader failed");
