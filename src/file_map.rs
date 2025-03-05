@@ -23,6 +23,14 @@ pub struct FileMap {
 }
 
 impl FileMap {
+	///
+	/// * `FileMap` - A new instance of `FileMap`.
+	///
+	/// # Example
+	///
+	/// ```
+	/// let file_map = FileMap::new();
+	/// ```
 	pub fn new() -> Self {
 		Self::default()
 	}
@@ -56,6 +64,12 @@ impl FileMap {
 				return Err(Error::new(ErrorKind::Other, "file is being written"));
 			}
 		}
+		{
+			let m = self.writers.lock().unwrap();
+			if m.contains_key(&path) {
+				return Err(Error::new(ErrorKind::Other, "file is being written"));
+			}
+		}
 		let mut m = self.files.lock().unwrap();
 		match m.get(&path) {
 			Some(f) => Ok(f.clone()),
@@ -67,6 +81,36 @@ impl FileMap {
 		}
 	}
 
+	/// Attempts to acquire a writer for the specified file path.
+	///
+	/// This method will continuously try to acquire a writer for the file at the given path.
+	/// If the file is currently being written by another writer, it will yield and retry until
+	/// it succeeds or encounters an error other than `ErrorKind::Other`.
+	///
+	/// # Arguments
+	///
+	/// * `path` - A string slice that holds the path of the file to be written.
+	/// * `append` - A boolean indicating whether to append to the file if it exists.
+	///
+	/// # Returns
+	///
+	/// * `Result<Writer<'_>>` - On success, returns a `Writer` for the file. On failure, returns an error.
+	///
+	/// # Errors
+	///
+	/// This function will return an error if it fails to acquire a writer for reasons other than
+	/// the file being currently written by another writer.
+	///
+	/// # Example
+	///
+	/// ```ignore
+	/// let file_map = FileMap::new();
+	/// let writer = file_map.writer("/path/to/file", false).await?;
+	/// ```
+	///
+	/// # Panics
+	///
+	/// This function will panic if the mutex is poisoned.
 	pub async fn writer(&self, path: &str, append: bool) -> Result<Writer<'_>> {
 		loop {
 			match self.try_writer(path, append).await {
@@ -83,7 +127,6 @@ impl FileMap {
 		let path = path.to_owned();
 		{
 			let mut wm = self.writers.lock().unwrap();
-
 			match wm.get(&path) {
 				Some(_) => return Err(Error::new(ErrorKind::Other, MULTIPLE_WRITERS)),
 				None => {
@@ -113,8 +156,8 @@ impl FileMap {
 		match f {
 			Ok(f) => Ok(Writer { fm: self, path, f }),
 			Err(err) => {
-				let mut fm = self.files.lock().unwrap();
-				fm.remove(&path);
+				let mut wm = self.writers.lock().unwrap();
+				wm.remove(&path);
 				Err(err)
 			}
 		}
@@ -137,17 +180,25 @@ impl FileMap {
 	/// let mmap_file = file_map.get("/path/to/file").await?;
 	/// file_map.remove("/path/to/file");
 	/// ```
-	pub fn remove(&self, path: &str) -> Option<MmapFile> {
+	pub fn remove(&self, path: &str) {
 		let mut m = self.files.lock().unwrap();
-		m.remove(path)
+		m.remove(path);
 	}
 
-	pub async fn remove_blocking(&self, path: &str) {
-		let mut m = self.files.lock().unwrap();
-		if let Some(f) = m.remove(path) {
-			while f.reader_count() > 1 {
-				yield_now().await;
+	pub async fn remove_blocking(&self, path: &str) -> Option<MmapFile> {
+		let f = {
+			let mut m = self.files.lock().unwrap();
+			m.remove(path)
+		};
+
+		match f {
+			Some(f) => {
+				while f.reader_count() > 1 {
+					yield_now().await;
+				}
+				return Some(f);
 			}
+			None => None,
 		}
 	}
 }
